@@ -2228,6 +2228,14 @@ config ARCH_BOARD_XIAO_RP2350
 	---help---
 		This is a port to the Seeed Xiao RP2350 board.
 
+config ARCH_BOARD_W5500_EVB_PICO2
+	bool "WIZnet W5500-EVB-Pico2 board"
+	depends on ARCH_CHIP_RP23XX
+	select ARCH_HAVE_LEDS
+	---help---
+		This is a port to the WIZnet W5500-EVB-Pico2 board (RP2350 with an
+		onboard WIZnet W5500 SPI Ethernet controller).
+
 config ARCH_BOARD_PIMORONI_PICO_2_PLUS
 	bool "Pimoroni Pico 2 Plus"
 	depends on ARCH_CHIP_RP23XX
@@ -3897,6 +3905,7 @@ config ARCH_BOARD
 	default "raspberrypi-pico-2"           if ARCH_BOARD_RASPBERRYPI_PICO_2
 	default "raspberrypi-pico-2-rv"        if ARCH_BOARD_RASPBERRYPI_PICO_2_RV
 	default "xiao-rp2350"                  if ARCH_BOARD_XIAO_RP2350
+	default "w5500-evb-pico2"              if ARCH_BOARD_W5500_EVB_PICO2
 	default "pimoroni-pico-2-plus"         if ARCH_BOARD_PIMORONI_PICO_2_PLUS
 	default "w5500-evb-pico"               if ARCH_BOARD_W5500_EVB_PICO
 	default "waveshare-rp2040-zero"        if ARCH_BOARD_WAVESHARE_RP2040_ZERO
@@ -4424,6 +4433,9 @@ source "boards/arm/rp23xx/raspberrypi-pico-2/Kconfig"
 endif
 if ARCH_BOARD_XIAO_RP2350
 source "boards/arm/rp23xx/xiao-rp2350/Kconfig"
+endif
+if ARCH_BOARD_W5500_EVB_PICO2
+source "boards/arm/rp23xx/w5500-evb-pico2/Kconfig"
 endif
 if ARCH_BOARD_PIMORONI_PICO_2_PLUS
 source "boards/arm/rp23xx/pimoroni-pico-2-plus/Kconfig"
