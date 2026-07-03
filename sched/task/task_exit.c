@@ -77,14 +77,19 @@ int nxtask_exit(void)
   FAR struct tcb_s *dtcb;
   FAR struct tcb_s *rtcb;
   int ret;
-#ifdef CONFIG_SMP
   /* Avoid using this_task() because it may assume a state that is not
-   * appropriate for an exiting task.
+   * appropriate for an exiting task.  If a higher-priority task is
+   * scheduled to the ready-to-run head with the context switch still
+   * deferred during the exit path (e.g. the long CONFIG_BINFMT_LOADABLE
+   * module teardown), the head no longer matches the running task and
+   * this_task() would name the wrong task, causing the removal/release
+   * below to operate on the wrong TCB.  Use the actually-running task.
    */
 
+#ifdef CONFIG_SMP
   dtcb = current_task(this_cpu());
 #else
-  dtcb = this_task();
+  dtcb = g_running_tasks[this_cpu()];
 #endif
 
   sinfo("%s pid=%d,TCB=%p\n", get_task_name(dtcb),
