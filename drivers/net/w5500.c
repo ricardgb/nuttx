@@ -91,6 +91,18 @@
 
 #define W5500_TXTIMEOUT (60 * CLK_TCK)
 
+/* PHY link monitor.  The W5500 provides no link-change interrupt in MACRAW
+ * mode, so the PHY link state is polled periodically.  After the link has
+ * been down for W5500_LINK_KICK_AFTER consecutive polls, the PHY is kicked
+ * (reset with all-capable auto-negotiation) and re-kicked every
+ * W5500_LINK_KICK_EVERY polls for as long as the link stays down.
+ */
+
+#define W5500_LINKPOLL_DELAY  (1 * CLK_TCK)   /* Poll the PHY once a second */
+#define W5500_LINK_DEBOUNCE   (3)             /* Down-reads before carrier off */
+#define W5500_LINK_KICK_AFTER (5)
+#define W5500_LINK_KICK_EVERY (60)
+
 /* Packet buffer size */
 
 #define PKTBUF_SIZE (MAX_NETDEV_PKTSIZE + CONFIG_NET_GUARDSIZE)
@@ -367,6 +379,10 @@ struct w5500_driver_s
   struct wdog_s w_txtimeout;  /* TX timeout timer */
   struct work_s w_irqwork;    /* For deferring interrupt work to the work queue */
   struct work_s w_pollwork;   /* For deferring poll work to the work queue */
+  struct wdog_s w_linkpoll;   /* Periodic PHY link monitor timer */
+  struct work_s w_linkwork;   /* For deferring link monitor work */
+  bool w_linkup;              /* Last observed PHY link state */
+  uint16_t w_linkdown_polls;  /* Consecutive polls with the link down */
 
   /* Ethernet frame transmission buffer management */
 
@@ -419,6 +435,9 @@ static int  w5500_interrupt(int irq, FAR void *context, FAR void *arg);
 
 static void w5500_txtimeout_work(FAR void *arg);
 static void w5500_txtimeout_expiry(wdparm_t arg);
+
+static void w5500_linkpoll_work(FAR void *arg);
+static void w5500_linkpoll_expiry(wdparm_t arg);
 
 /* NuttX callback functions */
 
@@ -1773,6 +1792,15 @@ static void w5500_txtimeout_work(FAR void *arg)
       self->w_bifup = true;
       self->lower->enable(self->lower, true);
 
+      /* Restart the PHY link monitor (the fence in the expiry handler
+       * stopped it, and w5500_unfence() verified the link is up again).
+       */
+
+      self->w_linkup         = true;
+      self->w_linkdown_polls = 0;
+      wd_start(&self->w_linkpoll, W5500_LINKPOLL_DELAY,
+               w5500_linkpoll_expiry, (wdparm_t)self);
+
       /* Then poll the network for new XMIT data */
 
       devif_poll(&self->w_dev, w5500_txpoll);
@@ -1827,6 +1855,143 @@ static void w5500_txtimeout_expiry(wdparm_t arg)
 }
 
 /****************************************************************************
+ * Name: w5500_linkpoll_work
+ *
+ * Description:
+ *   Periodic PHY link monitor.  The W5500 provides no link-change
+ *   interrupt in MACRAW mode, so without this the driver would report the
+ *   interface RUNNING forever even after the PHY silently drops the link
+ *   (observed on real hardware), leaving the network stack queueing into
+ *   a linkless device with no diagnostic.
+ *
+ *   The monitor reports link changes to the network stack via
+ *   netdev_carrier_on/off() and, if the link stays down, periodically
+ *   kicks the PHY (reset with all-capable auto-negotiation) to try to
+ *   bring it back without user intervention.
+ *
+ * Input Parameters:
+ *   arg - The argument passed when work_queue() was called.
+ *
+ * Assumptions:
+ *   Runs on a worker thread.
+ *
+ ****************************************************************************/
+
+static void w5500_linkpoll_work(FAR void *arg)
+{
+  FAR struct w5500_driver_s *self = (FAR struct w5500_driver_s *)arg;
+  bool linkup;
+
+  netdev_lock(&self->w_dev);
+
+  if (!self->w_bifup)
+    {
+      /* The interface went down while this work was queued.  Do not
+       * re-arm; polling is restarted by the next w5500_ifup().
+       */
+
+      netdev_unlock(&self->w_dev);
+      return;
+    }
+
+  linkup = (w5500_read8(self, W5500_BSB_COMMON_REGS, W5500_PHYCFGR) &
+            PHYCFGR_LNK) != 0;
+
+  if (linkup)
+    {
+      self->w_linkdown_polls = 0;
+
+      if (!self->w_linkup)
+        {
+          self->w_linkup = true;
+          ninfo("PHY link restored\n");
+          netdev_carrier_on(&self->w_dev);
+
+          /* Poll the stack so traffic that queued while the link was
+           * down gets transmitted now.
+           */
+
+          devif_poll(&self->w_dev, w5500_txpoll);
+        }
+    }
+  else
+    {
+      self->w_linkdown_polls++;
+
+      /* Debounce: a single low LNK reading can be a glitched SPI read
+       * (this driver runs on boards with marginal SPI integrity), and
+       * reporting carrier-off on it would needlessly interrupt traffic.
+       * Only report the loss after several consecutive down readings.
+       */
+
+      if (self->w_linkup &&
+          self->w_linkdown_polls >= W5500_LINK_DEBOUNCE)
+        {
+          self->w_linkup = false;
+          nwarn("PHY link lost\n");
+          netdev_carrier_off(&self->w_dev);
+        }
+
+      if (self->w_linkdown_polls == W5500_LINK_KICK_AFTER ||
+          (self->w_linkdown_polls > W5500_LINK_KICK_AFTER &&
+           ((self->w_linkdown_polls - W5500_LINK_KICK_AFTER) %
+            W5500_LINK_KICK_EVERY) == 0))
+        {
+          /* The link has stayed down; try to revive it by resetting the
+           * PHY into all-capable auto-negotiation mode.  Per [W5500]
+           * PHYCFGR.RST is active low: write 0 to reset the PHY, then
+           * set it back to 1.  A PHY reset does not disturb the common
+           * or socket registers.
+           *
+           * NOTE: the re-kick interval must be generous.  A PHY reset
+           * restarts auto-negotiation from scratch, and against some
+           * link partners negotiation can take tens of seconds --
+           * re-kicking faster than the link can re-negotiate keeps the
+           * link down FOREVER (observed on real hardware with a 10 s
+           * re-kick against a switch that took 15-50 s to negotiate).
+           */
+
+          nwarn("PHY link down for %u polls - resetting PHY\n",
+                self->w_linkdown_polls);
+
+          w5500_write8(self, W5500_BSB_COMMON_REGS, W5500_PHYCFGR,
+                       PHYCFGR_OPMD | PHYCFGR_OPMDC_ALLCAP_AN);
+          w5500_write8(self, W5500_BSB_COMMON_REGS, W5500_PHYCFGR,
+                       PHYCFGR_RST | PHYCFGR_OPMD | PHYCFGR_OPMDC_ALLCAP_AN);
+        }
+    }
+
+  netdev_unlock(&self->w_dev);
+
+  /* Re-arm the poll timer */
+
+  wd_start(&self->w_linkpoll, W5500_LINKPOLL_DELAY,
+           w5500_linkpoll_expiry, (wdparm_t)self);
+}
+
+/****************************************************************************
+ * Name: w5500_linkpoll_expiry
+ *
+ * Description:
+ *   Periodic link monitor timer expiration.  Defers the PHY poll to the
+ *   worker thread.
+ *
+ * Input Parameters:
+ *   arg  - The argument
+ *
+ * Assumptions:
+ *   Runs in the context of a the timer interrupt handler.
+ *
+ ****************************************************************************/
+
+static void w5500_linkpoll_expiry(wdparm_t arg)
+{
+  FAR struct w5500_driver_s *self = (FAR struct w5500_driver_s *)arg;
+
+  work_queue(ETHWORK, &self->w_linkwork, w5500_linkpoll_work, self, 0);
+}
+
+/****************************************************************************
  * Name: w5500_ifup
  *
  * Description:
@@ -1878,6 +2043,15 @@ static int w5500_ifup(FAR struct net_driver_s *dev)
 
   netdev_carrier_on(dev);
 
+  /* Start the periodic PHY link monitor (w5500_unfence() verified the
+   * link is up at this point).
+   */
+
+  self->w_linkup         = true;
+  self->w_linkdown_polls = 0;
+  wd_start(&self->w_linkpoll, W5500_LINKPOLL_DELAY,
+           w5500_linkpoll_expiry, (wdparm_t)self);
+
   return OK;
 }
 
@@ -1909,9 +2083,10 @@ static int w5500_ifdown(FAR struct net_driver_s *dev)
   flags = enter_critical_section();
   self->lower->enable(self->lower, false);
 
-  /* Cancel the TX timeout timer */
+  /* Cancel the TX timeout timer and the PHY link monitor */
 
   wd_cancel(&self->w_txtimeout);
+  wd_cancel(&self->w_linkpoll);
 
   /* Put the EMAC in its reset, non-operational state.  This should be
    * a known configuration that will guarantee the w5500_ifup() always
