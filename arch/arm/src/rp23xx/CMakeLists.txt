@@ -93,4 +93,8 @@ if(CONFIG_ARCH_USE_TEXT_HEAP)
   list(APPEND SRCS rp23xx_textheap.c)
 endif()
 
+if(CONFIG_IEEE80211_INFINEON_CYW43439)
+  list(APPEND SRCS rp23xx_cyw43439.c)
+endif()
+
 target_sources(arch PRIVATE ${SRCS})
