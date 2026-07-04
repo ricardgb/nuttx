@@ -1,0 +1,65 @@
+; arch/arm/src/rp23xx/rp23xx_pio_spi.pio
+;
+; SPDX-License-Identifier: Apache-2.0
+;
+; PIO program for a full-duplex SPI *master*, SPI mode 0
+; (CPOL = 0, CPHA = 0), MSB-first, 8 bits per frame.
+;
+; This file is *documentation only*.  It is the pioasm source that the
+; hand-assembled instruction words in "rp23xx_pio_spi.c" correspond to.
+; NuttX's rp23xx build does not run pioasm, so the encoded uint16_t words
+; live directly in the C file (exactly the way rp23xx_ws2812.c does it).
+; Keep this file and the C array in sync if you change the program.
+;
+; ---------------------------------------------------------------------------
+; Pin mapping (all configured by the C shim from the board Kconfig pins):
+;   - SCK  : side-set pin 0      (CONFIG_RP23XX_SPI0_SCK_GPIO, e.g. GPIO18)
+;   - MOSI : OUT  pin  base + 0  (CONFIG_RP23XX_SPI0_TX_GPIO,  e.g. GPIO19)
+;   - MISO : IN   pin  base + 0  (CONFIG_RP23XX_SPI0_RX_GPIO,  e.g. GPIO16)
+;
+; Shift configuration applied by the C shim:
+;   - OUT shift LEFT, autopull,  threshold  8  (MSB first out of OSR bit 31)
+;   - IN  shift LEFT, autopush,  threshold  8  (sampled byte ends in ISR[7:0])
+; The shim therefore left-justifies TX bytes ( byte << 24 ) before pushing,
+; and masks RX words with 0xff after popping.
+;
+; ---------------------------------------------------------------------------
+; Mode-0 timing (CPOL = 0 -> SCK idles LOW; CPHA = 0 -> data is launched on
+; the trailing/falling edge and *captured* on the leading/rising edge):
+;
+;   SCK   ___      ___________            ___________
+;        |   |    |           |          |
+;        |   |____|           |__________|
+;          ^      ^      ^                ^
+;          |      |      |                |
+;          |      |      +-- IN samples MISO, SAMPLE_DELAY cycles after the
+;          |      |          rising edge (the whole point of using PIO)
+;          |      +--------- rising edge (SCK driven high by the NOP)
+;          +---------------- MOSI driven while SCK is low (setup time)
+;
+; Per-bit instruction sequence (SAMPLE_DELAY == the tunable Kconfig value
+; CONFIG_RP23XX_PIO_SPI_SAMPLE_DELAY, in PIO clock cycles):
+;
+.program rp23xx_pio_spi
+.side_set 1
+
+.wrap_target
+    out pins, 1   side 0 [1]            ; Drive MOSI, hold SCK low (2 cyc setup).
+                                        ;   Stalls here (SCK low) when the TX
+                                        ;   FIFO/OSR is empty -> clean idle.
+    nop           side 1 [SAMPLE_DELAY] ; Rising edge of SCK, then wait
+                                        ;   SAMPLE_DELAY+1 cycles for the
+                                        ;   W5500 SO line to settle.
+    in  pins, 1   side 1 [0]            ; Capture MISO (SCK still high), autopush
+.wrap                                   ;   after 8 bits.  Wrap -> falling edge
+                                        ;   happens on the next 'out side 0'.
+;
+; Cycles per bit  = (1 + 1) + (1 + SAMPLE_DELAY) + (1 + 0) = 4 + SAMPLE_DELAY.
+; SCK low  time   =  2 cycles.
+; SCK high time   =  2 + SAMPLE_DELAY cycles.
+;
+; The MISO sample point is moved purely by the delay slot on the NOP, so the
+; hardware engineer can sweep CONFIG_RP23XX_PIO_SPI_SAMPLE_DELAY without
+; touching anything else.  Note the RP2350 input synchroniser adds ~2 cycles
+; of latency on MISO; that latency is *included* in what SAMPLE_DELAY has to
+; cover (or bypass it with rp23xx_pio_set_input_sync_bypass()).

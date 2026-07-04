@@ -52,6 +52,10 @@ if(CONFIG_RP23XX_SPI)
   list(APPEND SRCS rp23xx_spi.c)
 endif()
 
+if(CONFIG_RP23XX_PIO_SPI)
+  list(APPEND SRCS rp23xx_pio_spi.c)
+endif()
+
 if(CONFIG_RP23XX_PWM)
   list(APPEND SRCS rp23xx_pwm.c)
 endif()
