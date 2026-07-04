@@ -91,6 +91,18 @@
 
 #define W5500_TXTIMEOUT (60 * CLK_TCK)
 
+/* PHY link monitor.  The W5500 provides no link-change interrupt in MACRAW
+ * mode, so the PHY link state is polled periodically.  After the link has
+ * been down for W5500_LINK_KICK_AFTER consecutive polls, the PHY is kicked
+ * (reset with all-capable auto-negotiation) and re-kicked every
+ * W5500_LINK_KICK_EVERY polls for as long as the link stays down.
+ */
+
+#define W5500_LINKPOLL_DELAY  (1 * CLK_TCK)   /* Poll the PHY once a second */
+#define W5500_LINK_DEBOUNCE   (3)             /* Down-reads before carrier off */
+#define W5500_LINK_KICK_AFTER (5)
+#define W5500_LINK_KICK_EVERY (60)
+
 /* Packet buffer size */
 
 #define PKTBUF_SIZE (MAX_NETDEV_PKTSIZE + CONFIG_NET_GUARDSIZE)
@@ -367,6 +379,10 @@ struct w5500_driver_s
   struct wdog_s w_txtimeout;  /* TX timeout timer */
   struct work_s w_irqwork;    /* For deferring interrupt work to the work queue */
   struct work_s w_pollwork;   /* For deferring poll work to the work queue */
+  struct wdog_s w_linkpoll;   /* Periodic PHY link monitor timer */
+  struct work_s w_linkwork;   /* For deferring link monitor work */
+  bool w_linkup;              /* Last observed PHY link state */
+  uint16_t w_linkdown_polls;  /* Consecutive polls with the link down */
 
   /* Ethernet frame transmission buffer management */
 
@@ -420,6 +436,9 @@ static int  w5500_interrupt(int irq, FAR void *context, FAR void *arg);
 static void w5500_txtimeout_work(FAR void *arg);
 static void w5500_txtimeout_expiry(wdparm_t arg);
 
+static void w5500_linkpoll_work(FAR void *arg);
+static void w5500_linkpoll_expiry(wdparm_t arg);
+
 /* NuttX callback functions */
 
 static int  w5500_ifup(FAR struct net_driver_s *dev);
@@ -459,9 +478,9 @@ static int  w5500_ioctl(FAR struct net_driver_s *dev, int cmd,
  *   keep  - Whether the hardware reset shall be left asserted.
  *
  * Assumptions:
- *   This function must only be called in interrupt context, if argument
- *   keep is set to false (otherwise it sleeps, which is not allowed in
- *   interrupt context).
+ *   This function must NOT be called from interrupt context unless the
+ *   argument keep is set to true (with keep == false it sleeps, which is
+ *   not allowed in interrupt context).
  *
  ****************************************************************************/
 
@@ -757,6 +776,46 @@ static int w5500_read16_atomic(FAR struct w5500_driver_s *self,
   return -EIO;
 }
 
+/****************************************************************************
+ * Name: w5500_command
+ *
+ * Description:
+ *   Issue a socket 0 command and wait for the W5500 to accept it.  Per
+ *   [W5500] section 3.1.2.1, Sn_CR is automatically cleared to 0x00 after
+ *   the command is accepted; dependent registers (Sn_SR, Sn_RX_RSR, ...)
+ *   are only guaranteed to reflect the command after that.  Issuing a
+ *   dependent read back-to-back with the command write (as one SPI frame
+ *   after another) can observe stale state.
+ *
+ *   Command acceptance takes a few internal clock cycles, i.e. normally
+ *   less than one SPI frame time, so the loop below rarely iterates more
+ *   than once.  The retry bound only guards against a wedged chip.
+ *
+ * Input Parameters:
+ *   self    - The respective w5500 device
+ *   command - The SN_CR_* command to issue
+ *
+ ****************************************************************************/
+
+static void w5500_command(FAR struct w5500_driver_s *self, uint8_t command)
+{
+  int retries = 1000;
+
+  w5500_write8(self,
+               W5500_BSB_SOCKET_REGS(0),
+               W5500_SN_CR,
+               command);
+
+  while (w5500_read8(self, W5500_BSB_SOCKET_REGS(0), W5500_SN_CR) != 0)
+    {
+      if (--retries == 0)
+        {
+          nerr("Sn_CR command 0x%02"PRIx8" did not complete\n", command);
+          break;
+        }
+    }
+}
+
 /* Ethernet frame transmission buffer management ****************************/
 
 /****************************************************************************
@@ -776,6 +835,30 @@ static void w5500_txbuf_reset(FAR struct w5500_driver_s *self)
   memset(self->txbuf_offset, 0, sizeof(self->txbuf_offset));
   self->txbuf_rdptr = 0;
   self->txbuf_wrptr = 0;
+}
+
+/****************************************************************************
+ * Name: w5500_socket0_reopen
+ *
+ * Description:
+ *   Close and re-open socket 0 in MACRAW mode.  This clears a corrupted RX
+ *   buffer / framing state (e.g. after a garbled SPI read in the receive
+ *   path) and resyncs the MACRAW packet stream WITHOUT resetting the whole
+ *   chip or dropping the link.  It is used to recover from RX read
+ *   anomalies instead of fencing the device into permanent reset (which
+ *   would wedge the entire network stack until a power cycle).
+ *
+ * Input Parameters:
+ *   self - The respective w5500 device
+ *
+ ****************************************************************************/
+
+static void w5500_socket0_reopen(FAR struct w5500_driver_s *self)
+{
+  w5500_command(self, SN_CR_CLOSE);
+  w5500_command(self, SN_CR_OPEN);
+
+  w5500_txbuf_reset(self);
 }
 
 /****************************************************************************
@@ -881,7 +964,17 @@ static bool w5500_txbuf_next(FAR struct w5500_driver_s *self)
 {
   uint16_t offset;
 
-  DEBUGASSERT(w5500_txbuf_numpending(self));
+  if (!w5500_txbuf_numpending(self))
+    {
+      /* Spurious SEND_OK (e.g. a glitched Sn_IR read) with no transmission
+       * pending.  Advancing the read pointer here would underflow the ring
+       * (numfree would report 0 forever and all subsequent transmissions
+       * would be dropped), so just ignore it.
+       */
+
+      nwarn("Spurious SEND_OK ignored (no TX pending)\n");
+      return false;
+    }
 
   self->txbuf_rdptr = (self->txbuf_rdptr + 1) % (NUM_TXBUFS + 1);
 
@@ -903,10 +996,7 @@ static bool w5500_txbuf_next(FAR struct w5500_driver_s *self)
                 W5500_SN_TX_WR0,
                 offset);
 
-  w5500_write8(self,
-               W5500_BSB_SOCKET_REGS(0),
-               W5500_SN_CR,
-               SN_CR_SEND);
+  w5500_command(self, SN_CR_SEND);
 
   /* (Re-)start the TX timeout watchdog timer */
 
@@ -1019,12 +1109,12 @@ static int w5500_unfence(FAR struct w5500_driver_s *self)
                W5500_SIMR, /* Socket Interrupt Mask Register */
                SIMR(0));
 
-  /* Open socket 0 */
+  /* Open socket 0.  w5500_command() waits for the command to be accepted
+   * so that the SN_SR check below cannot race it and observe a stale
+   * (closed) status, which would fail ifup spuriously.
+   */
 
-  w5500_write8(self,
-               W5500_BSB_SOCKET_REGS(0),
-               W5500_SN_CR, /* Control Register */
-               SN_CR_OPEN);
+  w5500_command(self, SN_CR_OPEN);
 
   /* Check whether socket 0 is open in MACRAW mode. */
 
@@ -1141,10 +1231,7 @@ static void w5500_transmit(FAR struct w5500_driver_s *self)
 
       /* Send the packet */
 
-      w5500_write8(self,
-                   W5500_BSB_SOCKET_REGS(0),
-                   W5500_SN_CR, /* Control Register */
-                   SN_CR_SEND);
+      w5500_command(self, SN_CR_SEND);
 
       /* Setup the TX timeout watchdog (perhaps restarting the timer) */
 
@@ -1336,10 +1423,7 @@ static void w5500_receive(FAR struct w5500_driver_s *self)
                     W5500_SN_RX_RD0,
                     s0_rx_rd + pktlen);
 
-      w5500_write8(self,
-                   W5500_BSB_SOCKET_REGS(0),
-                   W5500_SN_CR,
-                   SN_CR_RECV);
+      w5500_command(self, SN_CR_RECV);
 
       /* Check for errors and update statistics */
 
@@ -1348,7 +1432,7 @@ static void w5500_receive(FAR struct w5500_driver_s *self)
         {
           nerr("Bad packet size dropped (%"PRIu16")\n", self->w_dev.d_len);
           self->w_dev.d_len = 0;
-          NETDEV_RXERRORS(&priv->dev);
+          NETDEV_RXERRORS(&self->w_dev);
           continue;
         }
 
@@ -1435,7 +1519,17 @@ static void w5500_receive(FAR struct w5500_driver_s *self)
   return;
 
 error:
-  w5500_fence(self);
+
+  /* A read anomaly in the RX path (typically a glitched SPI read producing
+   * an inconsistent RX size / packet length, or a stale read racing a RECV
+   * command) used to fence the chip into permanent reset, wedging the
+   * whole stack until a power cycle.  Instead, resync socket 0 and keep
+   * the interface alive; any partially-read frame is dropped.
+   */
+
+  nwarn("RX read anomaly - resyncing socket 0\n");
+  NETDEV_RXERRORS(&self->w_dev);
+  w5500_socket0_reopen(self);
 }
 
 /****************************************************************************
@@ -1539,38 +1633,48 @@ static void w5500_interrupt_work(FAR void *arg)
                    ir[0]);
     }
 
+  /* A SIR bit for any socket other than socket 0 is unexpected (only
+   * socket 0 is used) and can also be produced by a glitched SPI read.
+   * Tolerate it: warn and carry on rather than wedging the interface.
+   */
+
   if (ir[2] & ~SIR(0))
     {
-      nwarn("Interrupt pending for unused socket. SIR: 0x%02"PRIx8"\n",
+      nwarn("Ignoring interrupt for unused socket. SIR: 0x%02"PRIx8"\n",
             ir[2]);
-
-      goto error;
     }
 
-  if (ir[2] == 0)
+  if ((ir[2] & SIR(0)) == 0)
     {
-      nwarn("Overinitiative interrupt work.\n");
+      /* Nothing pending for socket 0 (or a spurious/garbled SIR read) */
 
       goto done;
     }
 
-  /* Get and clear interrupt status bits */
+  /* Read the socket 0 interrupt status, then acknowledge ALL pending bits,
+   * including any unexpected ones (a spurious DISCON/TIMEOUT/CON or a
+   * glitched SPI read).  Acknowledging everything ensures the device is
+   * never left with a stuck interrupt; then act only on the bits handled
+   * here (RECV / SEND_OK).
+   *
+   * NOTE: previously an unexpected SN_IR bit caused the device to be
+   * fenced into permanent hardware reset with no recovery, which wedged
+   * the entire network stack (incl. ARP) until a power cycle.  On a board
+   * with marginal SPI integrity a single glitched SN_IR read during a
+   * burst (e.g. a TCP connection teardown) was enough to trigger it.
+   * Tolerating unexpected bits keeps the interface alive.
+   */
 
   ir[0] = w5500_read8(self,
                       W5500_BSB_SOCKET_REGS(0),
                       W5500_SN_IR);
 
-  if ((ir[0] == 0) || ir[0] & ~(SN_INT_RECV | SN_INT_SEND_OK))
-    {
-      nerr("Unsupported socket interrupts: %02"PRIx8"\n", ir[0]);
-
-      goto error;
-    }
-
   w5500_write8(self,
                W5500_BSB_SOCKET_REGS(0),
                W5500_SN_IR,
                ir[0]);
+
+  ir[0] &= (SN_INT_RECV | SN_INT_SEND_OK);
 
   /* Handle interrupts according to status bit settings */
 
@@ -1594,15 +1698,16 @@ static void w5500_interrupt_work(FAR void *arg)
 done:
   netdev_unlock(&self->w_dev);
 
-  /* Re-enable Ethernet interrupts */
+  /* Re-enable Ethernet interrupts -- but only if the interface is still
+   * up.  Re-enabling after the device was fenced (w_bifup == false, chip
+   * held in reset, INTn line floating) would invite a level-triggered
+   * interrupt storm on boards without a pull-up on INTn.
+   */
 
-  self->lower->enable(self->lower, true);
-
-  return;
-
-error:
-  w5500_fence(self);
-  netdev_unlock(&self->w_dev);
+  if (self->w_bifup)
+    {
+      self->lower->enable(self->lower, true);
+    }
 }
 
 /****************************************************************************
@@ -1677,11 +1782,38 @@ static void w5500_txtimeout_work(FAR void *arg)
 
   if (w5500_unfence(self) == OK)
     {
+      /* Mark the interface up again BEFORE re-enabling interrupts: the
+       * expiry handler fenced the device, which cleared w_bifup, and
+       * w5500_txavail_work() silently drops all TX notifications while
+       * w_bifup is false -- without this, every recovery left outbound
+       * transmission permanently dead.
+       */
+
+      self->w_bifup = true;
       self->lower->enable(self->lower, true);
+
+      /* Restart the PHY link monitor (the fence in the expiry handler
+       * stopped it, and w5500_unfence() verified the link is up again).
+       */
+
+      self->w_linkup         = true;
+      self->w_linkdown_polls = 0;
+      wd_start(&self->w_linkpoll, W5500_LINKPOLL_DELAY,
+               w5500_linkpoll_expiry, (wdparm_t)self);
 
       /* Then poll the network for new XMIT data */
 
       devif_poll(&self->w_dev, w5500_txpoll);
+    }
+  else
+    {
+      /* Recovery failed; the device remains fenced.  Tell the network
+       * stack so applications see the interface go down instead of
+       * queueing into a dead device forever.
+       */
+
+      nerr("TX-timeout recovery failed; interface is down\n");
+      netdev_carrier_off(&self->w_dev);
     }
 
   netdev_unlock(&self->w_dev);
@@ -1720,6 +1852,143 @@ static void w5500_txtimeout_expiry(wdparm_t arg)
   /* Schedule to perform the TX timeout processing on the worker thread. */
 
   work_queue(ETHWORK, &self->w_irqwork, w5500_txtimeout_work, self, 0);
+}
+
+/****************************************************************************
+ * Name: w5500_linkpoll_work
+ *
+ * Description:
+ *   Periodic PHY link monitor.  The W5500 provides no link-change
+ *   interrupt in MACRAW mode, so without this the driver would report the
+ *   interface RUNNING forever even after the PHY silently drops the link
+ *   (observed on real hardware), leaving the network stack queueing into
+ *   a linkless device with no diagnostic.
+ *
+ *   The monitor reports link changes to the network stack via
+ *   netdev_carrier_on/off() and, if the link stays down, periodically
+ *   kicks the PHY (reset with all-capable auto-negotiation) to try to
+ *   bring it back without user intervention.
+ *
+ * Input Parameters:
+ *   arg - The argument passed when work_queue() was called.
+ *
+ * Assumptions:
+ *   Runs on a worker thread.
+ *
+ ****************************************************************************/
+
+static void w5500_linkpoll_work(FAR void *arg)
+{
+  FAR struct w5500_driver_s *self = (FAR struct w5500_driver_s *)arg;
+  bool linkup;
+
+  netdev_lock(&self->w_dev);
+
+  if (!self->w_bifup)
+    {
+      /* The interface went down while this work was queued.  Do not
+       * re-arm; polling is restarted by the next w5500_ifup().
+       */
+
+      netdev_unlock(&self->w_dev);
+      return;
+    }
+
+  linkup = (w5500_read8(self, W5500_BSB_COMMON_REGS, W5500_PHYCFGR) &
+            PHYCFGR_LNK) != 0;
+
+  if (linkup)
+    {
+      self->w_linkdown_polls = 0;
+
+      if (!self->w_linkup)
+        {
+          self->w_linkup = true;
+          ninfo("PHY link restored\n");
+          netdev_carrier_on(&self->w_dev);
+
+          /* Poll the stack so traffic that queued while the link was
+           * down gets transmitted now.
+           */
+
+          devif_poll(&self->w_dev, w5500_txpoll);
+        }
+    }
+  else
+    {
+      self->w_linkdown_polls++;
+
+      /* Debounce: a single low LNK reading can be a glitched SPI read
+       * (this driver runs on boards with marginal SPI integrity), and
+       * reporting carrier-off on it would needlessly interrupt traffic.
+       * Only report the loss after several consecutive down readings.
+       */
+
+      if (self->w_linkup &&
+          self->w_linkdown_polls >= W5500_LINK_DEBOUNCE)
+        {
+          self->w_linkup = false;
+          nwarn("PHY link lost\n");
+          netdev_carrier_off(&self->w_dev);
+        }
+
+      if (self->w_linkdown_polls == W5500_LINK_KICK_AFTER ||
+          (self->w_linkdown_polls > W5500_LINK_KICK_AFTER &&
+           ((self->w_linkdown_polls - W5500_LINK_KICK_AFTER) %
+            W5500_LINK_KICK_EVERY) == 0))
+        {
+          /* The link has stayed down; try to revive it by resetting the
+           * PHY into all-capable auto-negotiation mode.  Per [W5500]
+           * PHYCFGR.RST is active low: write 0 to reset the PHY, then
+           * set it back to 1.  A PHY reset does not disturb the common
+           * or socket registers.
+           *
+           * NOTE: the re-kick interval must be generous.  A PHY reset
+           * restarts auto-negotiation from scratch, and against some
+           * link partners negotiation can take tens of seconds --
+           * re-kicking faster than the link can re-negotiate keeps the
+           * link down FOREVER (observed on real hardware with a 10 s
+           * re-kick against a switch that took 15-50 s to negotiate).
+           */
+
+          nwarn("PHY link down for %u polls - resetting PHY\n",
+                self->w_linkdown_polls);
+
+          w5500_write8(self, W5500_BSB_COMMON_REGS, W5500_PHYCFGR,
+                       PHYCFGR_OPMD | PHYCFGR_OPMDC_ALLCAP_AN);
+          w5500_write8(self, W5500_BSB_COMMON_REGS, W5500_PHYCFGR,
+                       PHYCFGR_RST | PHYCFGR_OPMD | PHYCFGR_OPMDC_ALLCAP_AN);
+        }
+    }
+
+  netdev_unlock(&self->w_dev);
+
+  /* Re-arm the poll timer */
+
+  wd_start(&self->w_linkpoll, W5500_LINKPOLL_DELAY,
+           w5500_linkpoll_expiry, (wdparm_t)self);
+}
+
+/****************************************************************************
+ * Name: w5500_linkpoll_expiry
+ *
+ * Description:
+ *   Periodic link monitor timer expiration.  Defers the PHY poll to the
+ *   worker thread.
+ *
+ * Input Parameters:
+ *   arg  - The argument
+ *
+ * Assumptions:
+ *   Runs in the context of a the timer interrupt handler.
+ *
+ ****************************************************************************/
+
+static void w5500_linkpoll_expiry(wdparm_t arg)
+{
+  FAR struct w5500_driver_s *self = (FAR struct w5500_driver_s *)arg;
+
+  work_queue(ETHWORK, &self->w_linkwork, w5500_linkpoll_work, self, 0);
 }
 
 /****************************************************************************
@@ -1774,6 +2043,15 @@ static int w5500_ifup(FAR struct net_driver_s *dev)
 
   netdev_carrier_on(dev);
 
+  /* Start the periodic PHY link monitor (w5500_unfence() verified the
+   * link is up at this point).
+   */
+
+  self->w_linkup         = true;
+  self->w_linkdown_polls = 0;
+  wd_start(&self->w_linkpoll, W5500_LINKPOLL_DELAY,
+           w5500_linkpoll_expiry, (wdparm_t)self);
+
   return OK;
 }
 
@@ -1805,9 +2083,10 @@ static int w5500_ifdown(FAR struct net_driver_s *dev)
   flags = enter_critical_section();
   self->lower->enable(self->lower, false);
 
-  /* Cancel the TX timeout timer */
+  /* Cancel the TX timeout timer and the PHY link monitor */
 
   wd_cancel(&self->w_txtimeout);
+  wd_cancel(&self->w_linkpoll);
 
   /* Put the EMAC in its reset, non-operational state.  This should be
    * a known configuration that will guarantee the w5500_ifup() always
@@ -2066,7 +2345,7 @@ int w5500_initialize(FAR struct spi_dev_s *spi_dev,
 #ifdef CONFIG_NETDEV_IOCTL
   self->w_dev.d_ioctl   = w5500_ioctl;                    /* Handle network IOCTL commands */
 #endif
-  self->w_dev.d_private = g_w5500;                        /* Used to recover private state from dev */
+  self->w_dev.d_private = self;                           /* Used to recover private state from dev */
   self->spi_dev         = spi_dev;                        /* SPI hardware interconnect */
   self->lower           = lower;                          /* Low-level MCU specific support */
 
