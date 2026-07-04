@@ -527,3 +527,39 @@ config RP23XX_WS2812_PWR_GPIO
 		such a pin.
 
 endif # RP23XX_BOARD_HAS_WS2812
+
+#####################################################################
+#  W5500 Configuration
+#####################################################################
+
+if NET_W5500
+
+config RP23XX_W5500_SPI_CH
+	int "W5500 SPI channel number"
+	default 0
+	range 0 1
+	---help---
+		SPI device for W5500 chip.
+
+config RP23XX_W5500_SPI_FREQ
+	int "W5500 SPI frequency (kHz)"
+	default 40000
+	range 100 40000
+	---help---
+		SPI frequency for W5500 chip.
+
+config RP23XX_W5500_RST_GPIO
+	int "W5500 reset GPIO pin"
+	default 20
+	range 0 29
+	---help---
+		RP23XX pin number that connects to W5500 Reset
+
+config RP23XX_W5500_INT_GPIO
+	int "W5500 interrupt GPIO pin"
+	default 21
+	range 0 29
+	---help---
+		RP23XX pin number that connects to W5500 Interrupt
+
+endif # NET_W5500

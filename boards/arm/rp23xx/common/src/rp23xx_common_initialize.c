@@ -181,4 +181,24 @@ void rp23xx_common_initialize(void)
   rp23xx_gpio_setdir(CONFIG_RP23XX_SPI1_CS_GPIO, true);
   rp23xx_gpio_put(CONFIG_RP23XX_SPI1_CS_GPIO, true);
 #endif
+
+#ifdef CONFIG_NET_W5500
+  /* W5500 Reset output */
+
+  rp23xx_gpio_setdir(CONFIG_RP23XX_W5500_RST_GPIO, true);
+  rp23xx_gpio_put(CONFIG_RP23XX_W5500_RST_GPIO, false);
+  rp23xx_gpio_set_function(CONFIG_RP23XX_W5500_RST_GPIO,
+                           RP23XX_GPIO_FUNC_SIO);
+
+  /* W5500 Interrupt input.
+   *
+   * W5500 INTn is open-drain / active-low, so it needs a pull-up to return
+   * high when not asserted.  On RP2350 an internal pull-up is also the
+   * recommended mitigation for erratum RP2350-E9 (input pads can latch at
+   * ~2V with a pull-down or while floating); the pull-up is not affected.
+   */
+
+  rp23xx_gpio_init(CONFIG_RP23XX_W5500_INT_GPIO);
+  rp23xx_gpio_set_pulls(CONFIG_RP23XX_W5500_INT_GPIO, true, false);
+#endif
 }
