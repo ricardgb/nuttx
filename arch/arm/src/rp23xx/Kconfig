@@ -163,6 +163,43 @@ config RP23XX_SPI_DRIVER
 endif # RP23XX_SPI
 
 #####################################################################
+#  PIO-based SPI master (parallel/alternative to the PL022 SPI)
+#####################################################################
+
+config RP23XX_PIO_SPI
+	bool "PIO-based SPI master (for W5500 link tuning)"
+	default n
+	select SPI
+	---help---
+		Build an additive, PIO-backed SPI master that implements the same
+		struct spi_ops_s as the PL022 driver (rp23xx_spi.c) and can be
+		swapped in underneath the W5500 Ethernet driver via
+		rp23xx_pio_spibus_initialize().  Unlike the fixed-sample-point
+		PL022, the PIO SPI lets you move the MISO sample point by a tunable
+		number of PIO cycles (see RP23XX_PIO_SPI_SAMPLE_DELAY), which is
+		useful when the W5500 SO line is marginal at the desired SPI rate.
+
+		This reuses the SPI0/SPI1 pin Kconfig values (RX/CS/SCK/TX GPIO) and
+		consumes one PIO state machine.  It is hard-wired to SPI mode 0,
+		MSB-first, 8-bit frames -- exactly what the W5500 needs.
+
+if RP23XX_PIO_SPI
+
+config RP23XX_PIO_SPI_SAMPLE_DELAY
+	int "PIO SPI MISO sample delay (PIO cycles, 0-15)"
+	default 2
+	range 0 15
+	---help---
+		Number of PIO clock cycles to wait after the SCK rising edge before
+		sampling MISO.  This shifts the capture point into the centre of the
+		W5500's SO data eye.  Sweep this 0..15 on hardware (confirm the W5500
+		VERSIONR register reads 0x04 reliably) and pick the middle of the
+		clean range.  The RP2350 input synchroniser adds ~2 cycles of MISO
+		latency that this delay also has to absorb, hence the default of 2.
+
+endif # RP23XX_PIO_SPI
+
+#####################################################################
 #  I2C Configuration (Master)
 #####################################################################
 
